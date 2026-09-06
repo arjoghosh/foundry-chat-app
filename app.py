@@ -2,6 +2,7 @@ import hashlib
 import logging
 import os
 import time
+from pathlib import Path
 
 import streamlit as st
 from openai import (
@@ -26,9 +27,12 @@ from attachments import (
 # -------------------------
 # Page configuration
 # -------------------------
+APP_DIR = Path(__file__).resolve().parent
+ICON_PATH = APP_DIR / "assets" / "velora-icon.png"
+
 st.set_page_config(
-    page_title="Velora Chat",
-    page_icon="💬",
+    page_title="Velora",
+    page_icon=str(ICON_PATH),
     layout="centered",
 )
 
@@ -654,7 +658,8 @@ unanswered = bool(
 # Sidebar
 # -------------------------
 with st.sidebar:
-    st.title("💬 Velora Chat")
+    st.image(str(ICON_PATH), width=56)
+    st.title("Velora")
     st.caption("Local SQLite workspace")
 
     if st.button(
