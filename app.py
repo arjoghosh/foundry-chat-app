@@ -27,7 +27,7 @@ from attachments import (
 # Page configuration
 # -------------------------
 st.set_page_config(
-    page_title="Foundry Chat",
+    page_title="Velora Chat",
     page_icon="💬",
     layout="centered",
 )
@@ -654,7 +654,7 @@ unanswered = bool(
 # Sidebar
 # -------------------------
 with st.sidebar:
-    st.title("💬 Foundry Chat")
+    st.title("💬 Velora Chat")
     st.caption("Local SQLite workspace")
 
     if st.button(
@@ -801,7 +801,7 @@ with st.sidebar:
 # -------------------------
 # Conversation UI
 # -------------------------
-st.title("Foundry Chat")
+st.title("Velora Chat")
 st.caption(
     "Persistent conversations · ZIP source context · "
     "Streaming responses · Usage controls"
@@ -959,7 +959,7 @@ if selected_files and not busy and not unanswered:
     )
 
 prompt = st.chat_input(
-    "Ask about your code or message Foundry Chat…",
+    "Ask about your code or message Velora Chat…",
     disabled=busy or unanswered,
 )
 
