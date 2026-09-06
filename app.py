@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 import uuid
 from datetime import datetime, timezone
 
@@ -12,6 +13,9 @@ from openai import (
     RateLimitError,
 )
 
+# -------------------------
+# Page configuration
+# -------------------------
 st.set_page_config(
     page_title="Foundry Chat",
     page_icon="💬",
@@ -31,7 +35,7 @@ Provide complete, runnable examples when appropriate.
 Be clear about uncertainty and do not invent facts.
 """.strip()
 
-# Cosmetic styling. The actual dark theme comes from config.toml.
+# The dark theme itself is configured in .streamlit/config.toml.
 st.markdown(
     """
     <style>
@@ -72,7 +76,9 @@ st.markdown(
 # Configuration and client
 # -------------------------
 def get_setting(name: str, default: str = "") -> str:
+    """Read environment variables first, then Streamlit secrets."""
     value = os.getenv(name)
+
     if value:
         return value
 
@@ -95,6 +101,12 @@ def create_client(endpoint: str, api_key: str) -> OpenAI:
 endpoint = get_setting("AZURE_OPENAI_ENDPOINT")
 api_key = get_setting("AZURE_OPENAI_API_KEY")
 deployment = get_setting("AZURE_OPENAI_DEPLOYMENT")
+
+# Disable this setting if your deployment rejects stream_options.
+include_stream_usage = (
+    get_setting("AZURE_OPENAI_INCLUDE_USAGE", "true").strip().lower()
+    in {"true", "1", "yes", "on"}
+)
 
 if not all([endpoint, api_key, deployment]):
     st.error(
@@ -172,13 +184,13 @@ def delete_chat():
 
 def submit_prompt(prompt: str):
     prompt = prompt.strip()
-    if not prompt:
+
+    if not prompt or st.session_state.pending_job is not None:
         return
 
     chat = active_chat()
 
-    # Keep failed questions in history, but resolve the latest one
-    # before accepting a new question.
+    # Resolve an unanswered question before accepting another question.
     if chat["messages"] and chat["messages"][-1]["role"] == "user":
         return
 
@@ -186,7 +198,12 @@ def submit_prompt(prompt: str):
         title = " ".join(prompt.split())
         chat["title"] = title[:48] + ("…" if len(title) > 48 else "")
 
-    chat["messages"].append({"role": "user", "content": prompt})
+    chat["messages"].append(
+        {
+            "role": "user",
+            "content": prompt,
+        }
+    )
     chat["error"] = None
     chat["updated_at"] = now_iso()
 
@@ -197,6 +214,9 @@ def submit_prompt(prompt: str):
 
 
 def retry_latest():
+    if st.session_state.pending_job is not None:
+        return
+
     chat = active_chat()
 
     last_user_index = next(
@@ -212,6 +232,7 @@ def retry_latest():
         return
 
     # Replace the latest answer instead of duplicating the question.
+    # Metrics belonging to the replaced answer are also removed.
     chat["messages"] = chat["messages"][: last_user_index + 1]
     chat["error"] = None
     chat["updated_at"] = now_iso()
@@ -236,12 +257,83 @@ def discard_unanswered():
         chat["title"] = "New conversation"
 
 
+# -------------------------
+# Metrics and export
+# -------------------------
+def metrics_summary(metrics: dict) -> str:
+    """Build a summary without treating missing usage as zero."""
+    if not metrics:
+        return ""
+
+    parts = []
+
+    duration = metrics.get("duration_seconds")
+    if duration is not None:
+        parts.append(f"⏱ {duration:.2f} s")
+
+    if metrics.get("usage_available"):
+        for label, key in [
+            ("Input", "input_tokens"),
+            ("Output", "output_tokens"),
+            ("Total", "total_tokens"),
+        ]:
+            value = metrics.get(key)
+
+            if value is not None:
+                parts.append(f"{label}: {value:,} tokens")
+    else:
+        parts.append("Token usage unavailable")
+
+    return " · ".join(parts)
+
+
+def render_response_metrics(metrics: dict):
+    if not metrics:
+        return
+
+    st.caption(metrics_summary(metrics))
+
+    with st.expander("Response details"):
+        if metrics.get("deployment"):
+            st.caption(f"Deployment: {metrics['deployment']}")
+
+        first_text = metrics.get("time_to_first_text_seconds")
+        if first_text is not None:
+            st.caption(f"Time to first text: {first_text:.2f} s")
+
+        st.caption(
+            "Duration includes connection time and streaming, "
+            "including any SDK retry delays."
+        )
+
+        if metrics.get("usage_available"):
+            st.caption(
+                "Token counts are reported by the API, not estimated. "
+                "Input usage includes the instructions and conversation "
+                "context sent with this request."
+            )
+        else:
+            st.caption(
+                "No token usage was returned for this response. "
+                "Unavailable usage does not mean the request used zero tokens."
+            )
+
+
 def export_markdown(chat: dict) -> str:
     sections = [f"# {chat['title']}", ""]
 
     for message in chat["messages"]:
         speaker = "You" if message["role"] == "user" else "Assistant"
-        sections.append(f"## {speaker}\n\n{message['content']}\n")
+
+        sections.append(
+            f"## {speaker}\n\n{message['content']}\n"
+        )
+
+        if message["role"] == "assistant":
+            summary = metrics_summary(message.get("metrics", {}))
+
+            if summary:
+                sections.append(f"*{summary}*\n")
 
     return "\n".join(sections)
 
@@ -249,15 +341,47 @@ def export_markdown(chat: dict) -> str:
 # -------------------------
 # Model streaming
 # -------------------------
-def stream_answer(messages: list):
-    stream = client.chat.completions.create(
-        model=deployment,
-        messages=messages,
-        stream=True,
+def stream_answer(messages: list, metrics: dict):
+    """Yield response text and collect timing/API usage metadata."""
+    started_at = time.perf_counter()
+    stream = None
+
+    metrics.update(
+        {
+            "deployment": deployment,
+            "duration_seconds": None,
+            "time_to_first_text_seconds": None,
+            "input_tokens": None,
+            "output_tokens": None,
+            "total_tokens": None,
+            "usage_available": False,
+        }
     )
 
+    request_options = {}
+
+    if include_stream_usage:
+        request_options["stream_options"] = {"include_usage": True}
+
     try:
+        stream = client.chat.completions.create(
+            model=deployment,
+            messages=messages,
+            stream=True,
+            **request_options,
+        )
+
         for chunk in stream:
+            # Usage can arrive in a final chunk with no choices.
+            # Read it BEFORE skipping empty choices.
+            usage = getattr(chunk, "usage", None)
+
+            if usage is not None:
+                metrics["input_tokens"] = usage.prompt_tokens
+                metrics["output_tokens"] = usage.completion_tokens
+                metrics["total_tokens"] = usage.total_tokens
+                metrics["usage_available"] = True
+
             if not chunk.choices:
                 continue
 
@@ -269,8 +393,15 @@ def stream_answer(messages: list):
                     "Try rephrasing your question."
                 )
 
-            if choice.delta.content:
-                yield choice.delta.content
+            content = choice.delta.content
+
+            if content:
+                if metrics["time_to_first_text_seconds"] is None:
+                    metrics["time_to_first_text_seconds"] = (
+                        time.perf_counter() - started_at
+                    )
+
+                yield content
 
             if choice.finish_reason == "length":
                 yield (
@@ -278,19 +409,29 @@ def stream_answer(messages: list):
                     "*The response reached the model's output limit. "
                     "Ask me to continue if needed.*"
                 )
+
     finally:
-        stream.close()
+        metrics["duration_seconds"] = time.perf_counter() - started_at
+
+        if stream is not None:
+            stream.close()
 
 
 def friendly_error(exc: Exception) -> str:
     if isinstance(exc, AuthenticationError):
-        return "Authentication failed. Check the resource API key and endpoint."
+        return (
+            "Authentication failed. Check the resource API key and endpoint."
+        )
 
     if isinstance(exc, RateLimitError):
-        return "The deployment is rate-limited. Wait a moment, then retry."
+        return (
+            "The deployment is rate-limited. Wait a moment, then retry."
+        )
 
     if isinstance(exc, APIConnectionError):
-        return "Could not reach the deployment. Check your network and endpoint."
+        return (
+            "Could not reach the deployment. Check your network and endpoint."
+        )
 
     if isinstance(exc, APIStatusError):
         if exc.status_code == 404:
@@ -302,10 +443,14 @@ def friendly_error(exc: Exception) -> str:
         if exc.status_code == 400:
             return (
                 "The deployment rejected the request. Check model compatibility, "
-                "content restrictions, and conversation length."
+                "content restrictions, and conversation length. If the deployment "
+                "does not support streaming usage, set "
+                "AZURE_OPENAI_INCLUDE_USAGE to false."
             )
 
-        return f"The deployment returned HTTP {exc.status_code}. Please retry."
+        return (
+            f"The deployment returned HTTP {exc.status_code}. Please retry."
+        )
 
     if isinstance(exc, RuntimeError):
         return str(exc)
@@ -355,12 +500,17 @@ with st.sidebar:
 
     with st.expander("⚙️ Model settings"):
         st.caption(f"Deployment: {deployment}")
+        st.caption(
+            "Streaming usage: "
+            + ("enabled" if include_stream_usage else "disabled")
+        )
 
         history_turns = st.slider(
             "Previous turns to include",
             min_value=0,
             max_value=30,
             value=10,
+            key="history_turns",
             disabled=busy,
             help=(
                 "A turn is one question and answer. This is not a token limit; "
@@ -372,8 +522,11 @@ with st.sidebar:
             "System instructions",
             value=DEFAULT_SYSTEM_PROMPT,
             height=190,
+            key="system_prompt",
             disabled=busy,
-            help="Applies to the next response, including regenerated responses.",
+            help=(
+                "Applies to the next response, including regenerated responses."
+            ),
         )
 
     with st.expander("🗑️ Conversation management"):
@@ -394,7 +547,7 @@ with st.sidebar:
         )
 
     st.caption(
-        "History is stored in this session only. "
+        "History and response metrics are stored in this session only. "
         "Hover over a code block to copy its contents."
     )
 
@@ -447,8 +600,11 @@ for message in chat["messages"]:
     avatar = "🧑‍💻" if message["role"] == "user" else "🤖"
 
     with st.chat_message(message["role"], avatar=avatar):
-        # Markdown fenced code blocks include native copy controls.
+        # Fenced Markdown code blocks have native copy controls.
         st.markdown(message["content"])
+
+        if message["role"] == "assistant":
+            render_response_metrics(message.get("metrics", {}))
 
 if chat["error"]:
     st.error(chat["error"])
@@ -466,7 +622,10 @@ if chat["messages"]:
             use_container_width=True,
             on_click=retry_latest,
             disabled=busy,
-            help="Replaces the latest answer using the current settings.",
+            help=(
+                "Replaces the latest answer and its metrics "
+                "using the current settings."
+            ),
         )
 
     with export_col:
@@ -518,18 +677,33 @@ if job is not None:
     previous = target_chat["messages"][:user_index]
     previous = previous[-history_turns * 2 :] if history_turns else []
 
+    # Strip local metadata before sending messages to the API.
+    context_messages = [
+        {
+            "role": message["role"],
+            "content": message["content"],
+        }
+        for message in [
+            *previous,
+            target_chat["messages"][user_index],
+        ]
+    ]
+
     request_messages = [
         {
             "role": "system",
             "content": system_prompt.strip() or DEFAULT_SYSTEM_PROMPT,
         },
-        *previous,
-        target_chat["messages"][user_index],
+        *context_messages,
     ]
+
+    metrics = {}
 
     with st.chat_message("assistant", avatar="🤖"):
         try:
-            answer = st.write_stream(stream_answer(request_messages))
+            answer = st.write_stream(
+                stream_answer(request_messages, metrics)
+            )
 
             if not isinstance(answer, str) or not answer.strip():
                 raise RuntimeError(
@@ -538,24 +712,31 @@ if job is not None:
                 )
 
             target_chat["messages"].append(
-                {"role": "assistant", "content": answer}
+                {
+                    "role": "assistant",
+                    "content": answer,
+                    "metrics": metrics.copy(),
+                }
             )
             target_chat["error"] = None
 
         except Exception as exc:
-            # Do not save partial failed responses as complete answers.
-            # Keep raw exception details out of the public interface.
+            # Do not save partial failed responses as completed answers.
+            # Avoid exposing raw exceptions or credentials in the UI.
             logger.warning(
-                "Chat request failed: type=%s status=%s request_id=%s",
+                "Chat request failed: type=%s status=%s request_id=%s "
+                "duration_seconds=%s",
                 type(exc).__name__,
                 getattr(exc, "status_code", None),
                 getattr(exc, "request_id", None),
+                metrics.get("duration_seconds"),
             )
+
             target_chat["error"] = friendly_error(exc)
 
         finally:
             target_chat["updated_at"] = now_iso()
             st.session_state.pending_job = None
 
-    # Render the canonical saved history and restore the controls.
+    # Render saved history with metrics and restore the controls.
     st.rerun()
