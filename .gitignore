@@ -1,5 +1,9 @@
 # Streamlit configuration and secrets
-.streamlit/
+.streamlit/*
+!.streamlit/config.toml
+
+data/
+backups/
 
 # Environment variables
 .env

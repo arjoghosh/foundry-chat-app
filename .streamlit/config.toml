@@ -8,3 +8,4 @@ font = "sans serif"
 
 [client]
 toolbarMode = "minimal"
+address = "127.0.0.1"
