@@ -1,0 +1,21 @@
+# Streamlit configuration and secrets
+.streamlit/
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Python virtual environments
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
