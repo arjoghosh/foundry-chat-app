@@ -59,29 +59,47 @@ st.markdown(
     """
     <style>
     .block-container {
-        max-width: 900px;
-        padding-top: 2rem;
+        max-width: 960px;
+        padding-top: 2.5rem;
+        padding-bottom: 3rem;
     }
 
     [data-testid="stSidebar"] {
-        border-right: 1px solid rgba(255,255,255,0.07);
+        border-right: 1px solid rgba(217, 154, 115, 0.14);
     }
 
     [data-testid="stChatMessage"] {
-        border: 1px solid rgba(255,255,255,0.06);
-        border-radius: 16px;
+        background-color: #211C28;
+        border: 1px solid rgba(217, 154, 115, 0.12);
+        border-radius: 18px;
         margin-bottom: 1rem;
+        padding: 1.25rem;
     }
 
     div.stButton > button,
     div.stDownloadButton > button {
-        border-radius: 10px;
+        border-radius: 12px;
+        transition: border-color 0.2s ease, box-shadow 0.2s ease;
+    }
+
+    div.stButton > button:hover,
+    div.stDownloadButton > button:hover {
+        border-color: #D99A73;
+        box-shadow: 0 0 0 1px rgba(217, 154, 115, 0.18);
+    }
+
+    [data-testid="stChatInput"] {
+        border-radius: 16px;
+        border: 1px solid rgba(217, 154, 115, 0.25);
+    }
+
+    h1, h2, h3 {
+        letter-spacing: -0.025em;
     }
     </style>
     """,
     unsafe_allow_html=True,
 )
-
 
 # -------------------------
 # Configuration
