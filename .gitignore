@@ -1,3 +1,6 @@
+# Streamlit configuration and secrets
+.streamlit/
+
 # Environment variables
 .env
 .env.*
