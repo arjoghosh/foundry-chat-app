@@ -2,9 +2,11 @@ import hashlib
 import logging
 import os
 import time
+
 from pathlib import Path
 
 import streamlit as st
+
 from openai import (
     APIConnectionError,
     APIStatusError,
@@ -29,6 +31,11 @@ from attachments import (
 # -------------------------
 APP_DIR = Path(__file__).resolve().parent
 ICON_PATH = APP_DIR / "assets" / "velora-icon.png"
+
+st.logo(
+    str(ICON_PATH),
+    icon_image=str(ICON_PATH),
+)
 
 st.set_page_config(
     page_title="Velora",
