@@ -1,4 +1,4 @@
-# Foundry Chat
+# Velora Chat
 
 A ChatGPT-style developer chat application built with **Python**, **Streamlit**, and an **Azure OpenAI deployment in Microsoft Foundry**.
 
