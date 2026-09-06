@@ -2,23 +2,25 @@
 
 A ChatGPT-style developer chat application built with **Python**, **Streamlit**, and an **Azure OpenAI deployment in Microsoft Foundry**.
 
-Chat with your model, upload a ZIP of source files for analysis, retain conversations locally with SQLite, and monitor response duration and token usage.
+Chat with your model, upload a ZIP of source files for analysis, save conversations locally with SQLite, and monitor response duration and token usage.
 
 > Designed for trusted, local, single-user use. Authentication and user-isolated storage are not included.
 
 ## Features
 
-- **Streaming responses** with Markdown formatting
-- **Syntax-highlighted code blocks** with native copy controls
-- **Dark theme**
-- **Multiple persistent conversations** stored in SQLite
-- **Retry and regenerate** the latest response
-- **Markdown conversation export**
-- **Response metrics**, including duration, time to first text, and API-reported token usage when available
-- **Usage controls**, including daily request limits, token-budget reservations, input limits, output limits, and request cooldowns
-- **ZIP source-code uploads** with file selection and context preview
-- **Persistent attachment snapshots** saved with admitted questions
-- **Local ZIP validation** without extracting files to the filesystem or executing uploaded code
+- Streaming responses with Markdown formatting
+- Syntax-highlighted code blocks with native copy controls
+- Dark theme
+- Multiple persistent conversations stored in SQLite
+- Retry and regenerate the latest response
+- Markdown conversation export
+- Response duration, time to first text, and API-reported token usage
+- Daily request limits and token-budget reservations
+- Per-request input and output limits
+- Request cooldowns
+- ZIP source-code uploads with file selection and context preview
+- Persistent attachment snapshots saved with admitted questions
+- ZIP validation without extracting files to the filesystem or executing code
 
 ## Requirements
 
@@ -27,11 +29,11 @@ Chat with your model, upload a ZIP of source files for analysis, retain conversa
 - Its resource endpoint, API key, and exact deployment name
 - Internet access to the configured endpoint
 
-SQLite is included with standard Python installations through the sqlite3 module. No separate database server is required.
+SQLite is included with standard Python installations through the `sqlite3` module. No separate database server is required.
 
 ## Project Structure
 
-text
+```text
 foundry-chat/
 ├── app.py
 ├── attachments.py
@@ -45,9 +47,9 @@ foundry-chat/
 │   └── secrets.toml
 └── data/
     └── chat.db
+```
 
-
-The data/ directory and database are created automatically.
+The `data/` directory and database are created automatically.
 
 ## Quick Start
 
@@ -55,51 +57,51 @@ The data/ directory and database are created automatically.
 
 Replace the URL with your repository:
 
-bash
+```bash
 git clone https://github.com/YOUR-USERNAME/YOUR-REPOSITORY.git
 cd YOUR-REPOSITORY
-
+```
 
 ### 2. Create a virtual environment
 
-bash
+```bash
 python -m venv .venv
-
+```
 
 Activate it:
 
 **Windows PowerShell**
 
-powershell
+```powershell
 .venv\Scripts\Activate.ps1
-
+```
 
 **macOS / Linux**
 
-bash
+```bash
 source .venv/bin/activate
-
+```
 
 ### 3. Install dependencies
 
-bash
+```bash
 pip install -r requirements.txt
-
+```
 
 The current dependencies are:
 
-text
+```text
 streamlit>=1.40.0,<2.0.0
 openai>=1.55.0,<3.0.0
-
+```
 
 ZIP processing, hashing, and SQLite use Python's standard library.
 
 ### 4. Configure your deployment
 
-Create .streamlit/secrets.toml:
+Create `.streamlit/secrets.toml`:
 
-toml
+```toml
 AZURE_OPENAI_ENDPOINT = "https://YOUR-RESOURCE.openai.azure.com/openai/v1/"
 AZURE_OPENAI_API_KEY = "YOUR-API-KEY"
 AZURE_OPENAI_DEPLOYMENT = "YOUR-DEPLOYMENT-NAME"
@@ -113,34 +115,34 @@ daily_token_budget = 100000
 max_input_tokens = 16000
 max_output_tokens = 4000
 min_seconds_between_requests = 2
-
+```
 
 Important:
 
 - Use the **Azure OpenAI v1 endpoint**, not a Foundry project endpoint.
 - Use the **exact deployment name**, which may differ from the model name.
-- This app uses OpenAI(base_url=...); an API-version setting is not required for this configuration.
+- This app uses `OpenAI(base_url=...)`; an API-version setting is not required for this configuration.
 - The deployment must support Chat Completions.
-- Set AZURE_OPENAI_INCLUDE_USAGE = false if the deployment rejects streaming usage options.
-- Use "max_tokens" instead of "max_completion_tokens" only if required by your deployment.
+- Set `AZURE_OPENAI_INCLUDE_USAGE = false` if the deployment rejects streaming usage options.
+- Use `"max_tokens"` instead of `"max_completion_tokens"` only if required by your deployment.
 
 Environment variables take precedence over Streamlit secrets.
 
-Usage-limit environment variables use the USAGE_ prefix, for example:
+Usage-limit environment variables use the `USAGE_` prefix:
 
-text
+```text
 USAGE_DAILY_REQUESTS
 USAGE_DAILY_TOKEN_BUDGET
 USAGE_MAX_INPUT_TOKENS
 USAGE_MAX_OUTPUT_TOKENS
 USAGE_MIN_SECONDS_BETWEEN_REQUESTS
-
+```
 
 ### 5. Configure the dark theme
 
-Create .streamlit/config.toml:
+Create `.streamlit/config.toml`:
 
-toml
+```toml
 [theme]
 base = "dark"
 primaryColor = "#10a37f"
@@ -151,21 +153,21 @@ font = "sans serif"
 
 [server]
 address = "127.0.0.1"
+```
 
-
-Binding to 127.0.0.1 keeps the app accessible from the local machine rather than exposing it on all network interfaces.
+Binding to `127.0.0.1` keeps the app accessible from the local machine rather than exposing it on all network interfaces.
 
 ### 6. Start the app
 
-bash
+```bash
 streamlit run app.py
-
+```
 
 Open:
 
-text
+```text
 http://localhost:8501
-
+```
 
 ## Using the App
 
@@ -183,7 +185,7 @@ Conversation messages are saved locally in SQLite.
 1. Open **Attach source files from a ZIP**.
 2. Upload a project ZIP.
 3. Select the relevant files.
-4. Optionally preview the exact attachment context.
+4. Optionally preview the attachment context.
 5. Ask a question or use a suggested review prompt.
 
 Example questions:
@@ -218,11 +220,11 @@ ZIP archives may contain supported UTF-8 source and text files, including:
 - Markdown and plain text
 - SQL and shell scripts
 - JSON, YAML, TOML, XML, and CSV
-- Common project files such as Dockerfile, Makefile, and requirements.txt
+- Common project files such as `Dockerfile`, `Makefile`, and `requirements.txt`
 
 PDFs, images, compiled binaries, and nested archives are not processed as model context.
 
-The exact allowlist is defined in attachments.py.
+The exact allowlist is defined in `attachments.py`.
 
 ### Default ZIP limits
 
@@ -251,9 +253,9 @@ These checks reduce risk but do not constitute antivirus scanning or guarantee t
 
 Successful responses display available metrics:
 
-text
+```text
 ⏱ 4.28 s · Input: 1,240 · Output: 386 · Total: 1,626
-
+```
 
 - **Duration:** elapsed time for the model call and stream.
 - **Time to first text:** elapsed time until the first nonempty text chunk.
@@ -304,9 +306,9 @@ SQLite stores:
 
 The database is located at:
 
-text
+```text
 data/chat.db
-
+```
 
 SQLite may also create WAL and shared-memory files in the same directory.
 
@@ -324,15 +326,15 @@ If the server stops during generation, an attempt may remain marked as running.
 
 Stop Streamlit first, then run:
 
-bash
+```bash
 python storage.py --recover
-
+```
 
 Restart:
 
-bash
+```bash
 streamlit run app.py
-
+```
 
 Recovery marks unfinished attempts as interrupted. It does not resend requests or remove their unconfirmed token reservations.
 
@@ -346,7 +348,7 @@ Check:
 
 - The exact deployment name
 - The Azure OpenAI resource endpoint
-- The /openai/v1/ endpoint suffix
+- The `/openai/v1/` endpoint suffix
 - Chat Completions support
 
 Do not use the Foundry project endpoint.
@@ -356,7 +358,7 @@ Do not use the Foundry project endpoint.
 Check:
 
 - Whether the deployment supports the configured output-token parameter
-- Whether it supports stream_options={"include_usage": True}
+- Whether it supports `stream_options={"include_usage": True}`
 - Request/context size
 - Content restrictions
 
@@ -370,31 +372,31 @@ Select fewer or smaller files, reduce conversation history, or adjust the config
 
 ### ZIP file skipped or rejected
 
-Check attachments.py limits and the skipped-entry list. Only supported UTF-8 text files are processed.
+Check `attachments.py` limits and the skipped-entry list. Only supported UTF-8 text files are processed.
 
 ### SQLite import fails
 
 Verify your Python installation:
 
-bash
+```bash
 python -c "import sqlite3; print(sqlite3.sqlite_version)"
+```
 
-
-Some custom Python builds omit SQLite support. Fix the Python installation rather than adding sqlite3 to requirements.txt.
+Some custom Python builds omit SQLite support. Fix the Python installation rather than adding `sqlite3` to `requirements.txt`.
 
 ## Security and Privacy
 
 Never commit:
 
 - API keys or credentials
-- .streamlit/secrets.toml
-- .env files
-- data/
+- `.streamlit/secrets.toml`
+- `.env` files
+- `data/`
 - Database backups containing conversations or source code
 
-Recommended .gitignore entries:
+Recommended `.gitignore` entries:
 
-gitignore
+```gitignore
 .streamlit/*
 !.streamlit/config.toml
 
@@ -410,7 +412,7 @@ venv/
 __pycache__/
 *.py[cod]
 .DS_Store
-
+```
 
 Additional precautions:
 
