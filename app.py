@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import os
 import time
@@ -12,8 +13,19 @@ from openai import (
 )
 
 import storage
+from attachments import (
+    ATTACHMENT_INSTRUCTIONS,
+    AttachmentError,
+    MAX_ZIP_BYTES,
+    build_attachment_context,
+    read_zip_text_files,
+    to_api_message,
+)
 
 
+# -------------------------
+# Page configuration
+# -------------------------
 st.set_page_config(
     page_title="Foundry Chat",
     page_icon="💬",
@@ -39,14 +51,17 @@ st.markdown(
         max-width: 900px;
         padding-top: 2rem;
     }
+
     [data-testid="stSidebar"] {
         border-right: 1px solid rgba(255,255,255,0.07);
     }
+
     [data-testid="stChatMessage"] {
         border: 1px solid rgba(255,255,255,0.06);
         border-radius: 16px;
         margin-bottom: 1rem;
     }
+
     div.stButton > button,
     div.stDownloadButton > button {
         border-radius: 10px;
@@ -111,7 +126,7 @@ api_key = str(get_setting("AZURE_OPENAI_API_KEY"))
 deployment = str(get_setting("AZURE_OPENAI_DEPLOYMENT"))
 
 include_usage = (
-    str(get_setting("AZURE_OPENAI_INCLUDE_USAGE", True)).lower()
+    str(get_setting("AZURE_OPENAI_INCLUDE_USAGE", True)).strip().lower()
     in {"true", "1", "yes", "on"}
 )
 
@@ -123,7 +138,10 @@ output_parameter = str(
 )
 
 if not all([endpoint, api_key, deployment]):
-    st.error("Configure the Azure OpenAI endpoint, API key, and deployment.")
+    st.error(
+        "Configure AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, "
+        "and AZURE_OPENAI_DEPLOYMENT."
+    )
     st.stop()
 
 if output_parameter not in {"max_completion_tokens", "max_tokens"}:
@@ -195,6 +213,7 @@ def metrics_summary(metrics):
             ("Total", "total_tokens"),
         ]:
             value = metrics.get(key)
+
             if value is not None:
                 parts.append(f"{label}: {value:,}")
     else:
@@ -210,7 +229,21 @@ def export_markdown(chat):
         role = "You" if message["role"] == "user" else "Assistant"
         sections.append(f"## {role}\n\n{message['content']}\n")
 
+        attached = message.get("attachments", [])
+
+        if attached:
+            sections.append("Attached files:\n")
+
+            for item in attached:
+                sections.append(f"- {item['path']}")
+
+            sections.append(
+                "\n*Attachment contents are stored in the local database "
+                "and are not included in this export.*\n"
+            )
+
         summary = metrics_summary(message.get("metrics", {}))
+
         if summary:
             sections.append(f"*{summary}*\n")
 
@@ -225,7 +258,10 @@ def friendly_error(exc):
         return "The deployment is rate-limited. Wait and retry."
 
     if isinstance(exc, APIConnectionError):
-        return "Could not reach the deployment. Check your network and endpoint."
+        return (
+            "Could not reach the deployment. "
+            "Check your network and endpoint."
+        )
 
     if isinstance(exc, APIStatusError):
         if exc.status_code == 404:
@@ -281,7 +317,7 @@ def stream_answer(messages, metrics):
         )
 
         for chunk in stream:
-            # Usage can arrive with no choices.
+            # Usage can arrive in a final chunk with no choices.
             usage = getattr(chunk, "usage", None)
 
             if usage is not None:
@@ -320,6 +356,7 @@ def stream_answer(messages, metrics):
 
     finally:
         metrics["duration_seconds"] = time.perf_counter() - started
+
         if stream is not None:
             stream.close()
 
@@ -329,11 +366,253 @@ def show_notice(message):
 
 
 def queue_request(chat, prompt=None):
+    """
+    Snapshot selected files for a new question.
+
+    Retry does not use the current upload selection; it uses the
+    attachment snapshots already saved with the original question.
+    """
+    selected = []
+
+    if prompt is not None:
+        selected = [
+            dict(item)
+            for item in st.session_state.get(
+                f"selected_attachments_{chat['id']}",
+                [],
+            )
+        ]
+
     st.session_state.pending_job = {
         "chat_id": chat["id"],
         "revision": chat["revision"],
         "prompt": prompt,
+        "attachments": selected,
     }
+
+
+def reset_attachment_draft(chat_id):
+    """
+    Clear draft attachment state.
+
+    Incrementing the widget version gives the uploader a fresh key.
+    Saved message attachments are managed separately in SQLite.
+    """
+    version_key = f"attachment_version_{chat_id}"
+
+    st.session_state[version_key] = (
+        st.session_state.get(version_key, 0) + 1
+    )
+    st.session_state.pop(f"selected_attachments_{chat_id}", None)
+    st.session_state.pop(f"parsed_zip_{chat_id}", None)
+
+
+def render_saved_attachments(message):
+    saved_attachments = message.get("attachments", [])
+
+    if not saved_attachments:
+        return
+
+    with st.expander(f"📎 Attached files ({len(saved_attachments)})"):
+        for item in saved_attachments:
+            st.text(
+                f"{item['path']} — "
+                f"{item.get('size_bytes', 0):,} bytes"
+            )
+
+        st.caption(
+            "These file snapshots are stored with this question "
+            "and reused when retrying."
+        )
+
+
+def render_zip_attachments(chat, busy):
+    """
+    Render the ZIP picker and update the draft selection.
+
+    Parsed ZIP contents are cached only in this browser session, not in
+    a global Streamlit cache. Admitted questions persist their selected
+    file snapshots in SQLite.
+    """
+    chat_id = chat["id"]
+    selection_state_key = f"selected_attachments_{chat_id}"
+    cache_key = f"parsed_zip_{chat_id}"
+    version = st.session_state.get(f"attachment_version_{chat_id}", 0)
+
+    selected_files = []
+
+    with st.expander("📎 Attach source files from a ZIP", expanded=False):
+        st.warning(
+            "Selected file contents will be sent to your configured model "
+            "service when you submit a question. Review them for secrets first. "
+            "Automatic filtering cannot detect every credential."
+        )
+
+        uploaded_zip = st.file_uploader(
+            "Upload a source-code ZIP",
+            type=["zip"],
+            accept_multiple_files=False,
+            key=f"zip_upload_{chat_id}_{version}",
+            disabled=busy,
+            help=(
+                "Up to 10 MB compressed. Supported UTF-8 text files only. "
+                "256 KB per file and 2 MB total supported content."
+            ),
+        )
+
+        if uploaded_zip is not None:
+            if uploaded_zip.size > MAX_ZIP_BYTES:
+                st.error("ZIP exceeds the 10 MB upload limit.")
+                st.session_state.pop(cache_key, None)
+
+            else:
+                try:
+                    zip_bytes = uploaded_zip.getvalue()
+                    zip_hash = hashlib.sha256(zip_bytes).hexdigest()
+
+                    cached = st.session_state.get(cache_key)
+
+                    if not cached or cached["sha256"] != zip_hash:
+                        # Remove stale parsed content before inspecting a new ZIP.
+                        st.session_state.pop(cache_key, None)
+
+                        files, skipped = read_zip_text_files(zip_bytes)
+
+                        cached = {
+                            "sha256": zip_hash,
+                            "files": files,
+                            "skipped": skipped,
+                        }
+                        st.session_state[cache_key] = cached
+
+                    files = cached["files"]
+                    skipped = cached["skipped"]
+
+                    if not files:
+                        st.info("No supported UTF-8 text files were found.")
+
+                    else:
+                        by_path = {
+                            item["path"]: item
+                            for item in files
+                        }
+
+                        selected_paths = st.multiselect(
+                            "Files to include with your next question",
+                            options=list(by_path),
+                            default=[],
+                            key=(
+                                f"zip_selection_{chat_id}_"
+                                f"{version}_{zip_hash}"
+                            ),
+                            disabled=busy,
+                            help=(
+                                "Start with a few relevant files. Selecting "
+                                "the entire project may exceed your input limit."
+                            ),
+                        )
+
+                        selected_files = [
+                            dict(by_path[path])
+                            for path in selected_paths
+                        ]
+
+                        total_bytes = sum(
+                            item["size_bytes"]
+                            for item in selected_files
+                        )
+
+                        st.caption(
+                            f"{len(files)} supported files found · "
+                            f"{len(selected_files)} selected · "
+                            f"{total_bytes:,} selected bytes"
+                        )
+
+                        if selected_files:
+                            context = build_attachment_context(selected_files)
+
+                            # This excludes the final question, history,
+                            # and system instructions.
+                            attachment_estimate = estimate_input_tokens(
+                                [{"role": "user", "content": context}]
+                            )
+
+                            st.caption(
+                                "Attachment-only input estimate: "
+                                f"{attachment_estimate:,}. "
+                                "The final limit check also includes your "
+                                "question, instructions, and conversation history."
+                            )
+
+                            if (
+                                attachment_estimate
+                                > limits["max_input_tokens"]
+                            ):
+                                st.warning(
+                                    "These attachments already exceed the "
+                                    "configured input estimate limit. "
+                                    "Select fewer or smaller files."
+                                )
+
+                            if st.checkbox(
+                                "Preview the text that will be included",
+                                key=(
+                                    f"zip_preview_{chat_id}_"
+                                    f"{version}_{zip_hash}"
+                                ),
+                                disabled=busy,
+                            ):
+                                st.code(context, language="text")
+
+                    if skipped:
+                        st.caption(f"{len(skipped)} entries skipped.")
+
+                        if st.checkbox(
+                            "Show skipped entries",
+                            key=(
+                                f"zip_skipped_{chat_id}_"
+                                f"{version}_{zip_hash}"
+                            ),
+                            disabled=busy,
+                        ):
+                            st.code(
+                                "\n".join(skipped[:100]),
+                                language="text",
+                            )
+
+                            if len(skipped) > 100:
+                                st.caption(
+                                    "Showing the first 100 skipped entries."
+                                )
+
+                except AttachmentError as exc:
+                    st.session_state.pop(cache_key, None)
+                    st.error(str(exc))
+
+            if st.button(
+                "Remove draft upload",
+                key=f"remove_zip_{chat_id}_{version}",
+                disabled=busy,
+            ):
+                reset_attachment_draft(chat_id)
+                st.rerun()
+
+        else:
+            st.session_state.pop(cache_key, None)
+
+        st.caption(
+            "Selections apply to new questions. Retry uses the original "
+            "question's saved files. Removing a draft upload does not erase "
+            "attachments already saved in conversation history."
+        )
+
+        st.caption(
+            "For follow-up questions, avoid reattaching the same files if "
+            "their original message is still included in conversation history."
+        )
+
+    st.session_state[selection_state_key] = selected_files
+    return selected_files
 
 
 # -------------------------
@@ -354,10 +633,21 @@ if "pending_job" not in st.session_state:
     st.session_state.pending_job = None
 
 chat = storage.get_chat(st.session_state.active_chat_id)
+
+# Another browser tab may have deleted the conversation.
+if chat is None:
+    st.session_state.pop("active_chat_id", None)
+    st.session_state.pending_job = None
+    st.rerun()
+
 attempt = storage.latest_attempt(chat["id"])
 
 running = bool(attempt and attempt["status"] == "running")
 busy = running or st.session_state.pending_job is not None
+
+unanswered = bool(
+    chat["messages"] and chat["messages"][-1]["role"] == "user"
+)
 
 
 # -------------------------
@@ -418,12 +708,16 @@ with st.sidebar:
     )
 
     with st.expander("Usage details"):
-        st.write(f"API-reported tokens: {usage['reported_tokens']:,}")
+        st.write(
+            f"API-reported tokens: {usage['reported_tokens']:,}"
+        )
         st.write(
             "Unconfirmed reservations: "
             f"{usage['unconfirmed_tokens']:,}"
         )
-        st.write(f"Running requests today: {usage['running']}")
+        st.write(
+            f"Running requests today: {usage['running']}"
+        )
         st.caption(
             "Accounted tokens include reservations for running requests "
             "and requests without final API usage. This is not an Azure bill."
@@ -439,6 +733,10 @@ with st.sidebar:
             value=10,
             key="history_turns",
             disabled=busy,
+            help=(
+                "Earlier attachments are included only when their messages "
+                "are within this history window."
+            ),
         )
 
         system_prompt = st.text_area(
@@ -456,7 +754,11 @@ with st.sidebar:
         )
 
     with st.expander("🗑️ Conversation management"):
-        st.caption("Deletion does not reset usage accounting.")
+        st.caption(
+            "Clearing or deleting a conversation removes its saved messages "
+            "and attachment snapshots from active records. "
+            "Usage accounting is retained."
+        )
 
         if st.button(
             "Clear conversation",
@@ -464,9 +766,15 @@ with st.sidebar:
             disabled=busy,
         ):
             try:
-                storage.replace_chat(chat, [], "New conversation")
+                storage.replace_chat(
+                    chat,
+                    [],
+                    "New conversation",
+                )
+                reset_attachment_draft(chat["id"])
             except storage.ConflictError as exc:
                 show_notice(str(exc))
+
             st.rerun()
 
         if st.button(
@@ -476,14 +784,17 @@ with st.sidebar:
         ):
             try:
                 storage.delete_chat(chat)
+                reset_attachment_draft(chat["id"])
                 st.session_state.pop("active_chat_id", None)
             except storage.ConflictError as exc:
                 show_notice(str(exc))
+
             st.rerun()
 
     st.caption(
-        "History is saved locally. All sessions share this database. "
-        "Do not expose this app publicly without authentication."
+        "History and admitted attachment snapshots are saved locally. "
+        "All sessions share this database. Do not expose this app publicly "
+        "without authentication."
     )
 
 
@@ -491,26 +802,50 @@ with st.sidebar:
 # Conversation UI
 # -------------------------
 st.title("Foundry Chat")
-st.caption("Persistent conversations · Streaming responses · Usage controls")
+st.caption(
+    "Persistent conversations · ZIP source context · "
+    "Streaming responses · Usage controls"
+)
 
 notice = st.session_state.pop("notice", None)
+
 if notice:
     st.warning(notice)
+
+# Render before suggestion buttons and chat input so queue_request()
+# captures the current attachment selection.
+selected_files = render_zip_attachments(chat, busy)
 
 if not chat["messages"]:
     st.subheader("What would you like to build?")
 
-    suggestions = [
-        (
-            "🐍 Write Python",
-            "Write a Python function that removes duplicates from a list "
-            "while preserving order. Include tests.",
-        ),
-        (
-            "🔎 Explain code",
-            "Explain Python async and await with a runnable example.",
-        ),
-    ]
+    if selected_files:
+        suggestions = [
+            (
+                "🔎 Review selected files",
+                "Review the attached files for bugs, maintainability issues, "
+                "and potential security problems. Cite filenames and line "
+                "numbers, and distinguish definite findings from hypotheses.",
+            ),
+            (
+                "📖 Explain this project",
+                "Explain how the attached files work together. Describe the "
+                "main components and execution flow. Identify any missing "
+                "files needed for a more complete explanation.",
+            ),
+        ]
+    else:
+        suggestions = [
+            (
+                "🐍 Write Python",
+                "Write a Python function that removes duplicates from a list "
+                "while preserving order. Include tests.",
+            ),
+            (
+                "🔎 Explain code",
+                "Explain Python async and await with a runnable example.",
+            ),
+        ]
 
     columns = st.columns(2)
 
@@ -518,6 +853,7 @@ if not chat["messages"]:
         with columns[index]:
             if st.button(
                 label,
+                key=f"suggestion_{index}",
                 use_container_width=True,
                 disabled=busy,
             ):
@@ -527,8 +863,10 @@ if not chat["messages"]:
 for message in chat["messages"]:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
+        render_saved_attachments(message)
 
         metrics = message.get("metrics", {})
+
         if metrics:
             st.caption(metrics_summary(metrics))
 
@@ -536,13 +874,17 @@ for message in chat["messages"]:
                 st.caption(
                     f"Deployment: {metrics.get('deployment', 'Unknown')}"
                 )
+
                 first_text = metrics.get("time_to_first_text_seconds")
 
                 if first_text is not None:
-                    st.caption(f"Time to first text: {first_text:.2f} s")
+                    st.caption(
+                        f"Time to first text: {first_text:.2f} s"
+                    )
 
                 st.caption(
-                    "API token counts include the context sent with this request."
+                    "API token counts include conversation and attachment "
+                    "context sent with this request."
                 )
 
 if attempt and attempt["status"] in {"failed", "interrupted"}:
@@ -551,13 +893,9 @@ if attempt and attempt["status"] in {"failed", "interrupted"}:
 if running:
     st.info(
         "A request is running for this conversation. If it finished in "
-        "another tab, refresh. If the server stopped during generation, "
-        "use the recovery command described below."
+        "another tab, refresh the page. If the server stopped during generation, "
+        "stop Streamlit and run `python storage.py --recover` before restarting."
     )
-
-unanswered = bool(
-    chat["messages"] and chat["messages"][-1]["role"] == "user"
-)
 
 if chat["messages"]:
     retry_col, export_col, discard_col = st.columns(3)
@@ -567,6 +905,10 @@ if chat["messages"]:
             "↻ Retry" if unanswered else "↻ Regenerate",
             use_container_width=True,
             disabled=busy,
+            help=(
+                "Uses the original question's saved attachments and the "
+                "current history/system settings."
+            ),
         ):
             queue_request(chat)
             st.rerun()
@@ -593,17 +935,31 @@ if chat["messages"]:
                 storage.replace_chat(
                     chat,
                     remaining,
-                    chat["title"] if remaining else "New conversation",
+                    (
+                        chat["title"]
+                        if remaining
+                        else "New conversation"
+                    ),
                 )
             except storage.ConflictError as exc:
                 show_notice(str(exc))
+
             st.rerun()
 
 if unanswered and not busy:
-    st.caption("Retry or discard the unanswered question before continuing.")
+    st.caption(
+        "Retry or discard the unanswered question before continuing. "
+        "Changing the draft upload does not change attachments on that question."
+    )
+
+if selected_files and not busy and not unanswered:
+    st.caption(
+        f"📎 {len(selected_files)} selected file(s) will be attached "
+        "to your next question."
+    )
 
 prompt = st.chat_input(
-    "Message Foundry Chat…",
+    "Ask about your code or message Foundry Chat…",
     disabled=busy or unanswered,
 )
 
@@ -625,27 +981,57 @@ if job is not None:
     current = storage.get_chat(job["chat_id"])
 
     if current is None or current["revision"] != job["revision"]:
-        show_notice("Conversation changed. Please refresh and try again.")
+        show_notice(
+            "Conversation changed. Please refresh and try again."
+        )
         st.rerun()
 
     new_prompt = job["prompt"]
 
     if new_prompt is not None:
+        # Guard against adding another question after an unanswered one.
+        if (
+            current["messages"]
+            and current["messages"][-1]["role"] == "user"
+        ):
+            show_notice(
+                "Retry or discard the unanswered question first."
+            )
+            st.rerun()
+
+        user_message = {
+            "role": "user",
+            "content": new_prompt,
+        }
+
+        selected_attachments = job.get("attachments", [])
+
+        if selected_attachments:
+            user_message["attachments"] = selected_attachments
+
         base_messages = [
             *current["messages"],
-            {"role": "user", "content": new_prompt},
+            user_message,
         ]
         pending_messages = base_messages
 
         title = current["title"]
+
         if not current["messages"]:
             compact = " ".join(new_prompt.split())
-            title = compact[:48] + ("…" if len(compact) > 48 else "")
+            title = compact[:48] + (
+                "…" if len(compact) > 48 else ""
+            )
+
     else:
         last_user = next(
             (
                 index
-                for index in range(len(current["messages"]) - 1, -1, -1)
+                for index in range(
+                    len(current["messages"]) - 1,
+                    -1,
+                    -1,
+                )
                 if current["messages"][index]["role"] == "user"
             ),
             None,
@@ -655,6 +1041,7 @@ if job is not None:
             show_notice("There is no question to retry.")
             st.rerun()
 
+        # Saved attachments remain on the original user message.
         base_messages = current["messages"][: last_user + 1]
 
         # Keep the old successful answer until regeneration succeeds.
@@ -662,19 +1049,34 @@ if job is not None:
         title = current["title"]
 
     previous = base_messages[:-1]
-    previous = previous[-history_turns * 2 :] if history_turns else []
+    previous = (
+        previous[-history_turns * 2 :]
+        if history_turns
+        else []
+    )
 
+    # Convert persisted messages into supported API fields.
+    # User attachment snapshots become text inside their message content.
     request_messages = [
         {
             "role": "system",
-            "content": system_prompt.strip() or DEFAULT_SYSTEM_PROMPT,
+            "content": (
+                (system_prompt.strip() or DEFAULT_SYSTEM_PROMPT)
+                + "\n\n"
+                + ATTACHMENT_INSTRUCTIONS
+            ),
         },
         *[
-            {"role": item["role"], "content": item["content"]}
-            for item in [*previous, base_messages[-1]]
+            to_api_message(item)
+            for item in [
+                *previous,
+                base_messages[-1],
+            ]
         ],
     ]
 
+    # Includes filenames, numbered source text, history, instructions,
+    # and the current question before reserving usage.
     estimated_input = estimate_input_tokens(request_messages)
 
     try:
@@ -693,6 +1095,7 @@ if job is not None:
     if new_prompt is not None:
         with st.chat_message("user"):
             st.markdown(new_prompt)
+            render_saved_attachments(base_messages[-1])
 
     metrics = {}
     error = None
@@ -705,7 +1108,9 @@ if job is not None:
             )
 
             if not isinstance(answer, str) or not answer.strip():
-                raise RuntimeError("The deployment returned no text.")
+                raise RuntimeError(
+                    "The deployment returned no text."
+                )
 
             completed_messages = [
                 *base_messages,
@@ -727,7 +1132,7 @@ if job is not None:
             )
 
     # If execution is forcibly interrupted before this point, the attempt
-    # remains 'running' and its reservation remains charged.
+    # remains running and its reservation remains charged.
     try:
         storage.finish_attempt(
             attempt_id,
@@ -737,6 +1142,7 @@ if job is not None:
         )
     except Exception:
         logger.exception("Could not persist request completion.")
+
         st.error(
             "The request finished, but its result could not be saved. "
             "Its reservation remains in place. Check the database and logs."
